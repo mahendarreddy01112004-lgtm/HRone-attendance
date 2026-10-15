@@ -566,3 +566,102 @@ def employee_monthly(emp_code: str, month: str = Query(pattern=MONTH_RE)):
         "total_overtime_minutes": int(s.get("total_overtime_minutes", 0)),
         "attendance_pct": pct,
     }
+
+
+
+def present_days_expr(weekends: list) -> dict:
+    """Presence on a Mon-Fri counts 1, a half day counts 0.5, everything else 0."""
+    return {
+        "$cond": [
+            {"$and": [
+                {"$in": ["$status", PRESENCE]},
+                {"$eq": [{"$in": ["$date", weekends]}, False]},
+            ]},
+            {"$cond": [{"$eq": [{"$ifNull": ["$half_day", False]}, True]}, 0.5, 1]},
+            0,
+        ]
+    }
+
+
+@app.get("/analytics/late-leaderboard")
+def late_leaderboard(
+    month: str = Query(pattern=MONTH_RE),
+    limit: int = Query(5, ge=1, le=100),
+):
+    first, last = month_bounds(month)
+    pipeline = [
+        # uses the (date, emp_code) index
+        {"$match": {"date": {"$gte": first.isoformat(), "$lte": last.isoformat()}}},
+        {"$group": {
+            "_id": "$emp_code",
+            "total_late_minutes": {"$sum": {"$ifNull": ["$late_minutes", 0]}},
+            "late_count": {"$sum": {"$cond": [{"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0]}},
+        }},
+        {"$match": {"total_late_minutes": {"$gt": 0}}},
+        # most late minutes first; emp_code breaks ties so the result is always the same
+        {"$sort": {"total_late_minutes": -1, "_id": 1}},
+        {"$limit": limit},
+        {"$lookup": {"from": "employees", "localField": "_id", "foreignField": "emp_code", "as": "emp"}},
+        {"$project": {
+            "_id": 0,
+            "emp_code": "$_id",
+            "name": {"$first": "$emp.name"},
+            "department": {"$first": "$emp.department"},
+            "total_late_minutes": 1,
+            "late_count": 1,
+        }},
+    ]
+    rows = list(db.attendance_logs.aggregate(pipeline))
+    for i, r in enumerate(rows, start=1):
+        r["rank"] = i
+    return {"month": month, "limit": limit, "items": rows}
+
+
+@app.get("/analytics/departments/summary")
+def department_summary(month: str = Query(pattern=MONTH_RE)):
+    first, last = month_bounds(month)
+    weekends = weekend_dates(first, last)
+    zero = {"present_days": 0, "late_minutes": 0, "overtime_minutes": 0}
+    pipeline = [
+        # start from EMPLOYEES so people with zero logs are still counted in headcount;
+        # employees who joined after this month ended are not part of it
+        {"$match": {"joined_on": {"$lte": last.isoformat()}}},
+        {"$lookup": {
+            "from": "attendance_logs",
+            "let": {"code": "$emp_code"},
+            "pipeline": [
+                {"$match": {"$expr": {"$and": [
+                    {"$eq": ["$emp_code", "$$code"]},
+                    {"$gte": ["$date", first.isoformat()]},
+                    {"$lte": ["$date", last.isoformat()]},
+                ]}}},
+                {"$group": {
+                    "_id": None,
+                    "present_days": {"$sum": present_days_expr(weekends)},
+                    "late_minutes": {"$sum": {"$ifNull": ["$late_minutes", 0]}},
+                    "overtime_minutes": {"$sum": {"$ifNull": ["$overtime_minutes", 0]}},
+                }},
+            ],
+            "as": "s",
+        }},
+        # no logs -> empty array -> fall back to zeros
+        {"$addFields": {"s": {"$ifNull": [{"$first": "$s"}, {"$literal": zero}]}}},
+        {"$group": {
+            "_id": "$department",
+            "headcount": {"$sum": 1},
+            "total_present_days": {"$sum": "$s.present_days"},
+            "total_late_minutes": {"$sum": "$s.late_minutes"},
+            "total_overtime_minutes": {"$sum": "$s.overtime_minutes"},
+        }},
+        {"$sort": {"_id": 1}},
+        {"$project": {
+            "_id": 0,
+            "department": "$_id",
+            "headcount": 1,
+            "total_present_days": 1,
+            "total_late_minutes": 1,
+            "total_overtime_minutes": 1,
+        }},
+    ]
+    rows = list(db.employees.aggregate(pipeline))
+    return {"month": month, "departments": rows}
